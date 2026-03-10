@@ -1,123 +1,123 @@
 # Aligner
 
-Servizio Python per riallineare un file SRT a un testo tradotto libero, mantenendo i timestamp originali.
+Python service for realigning an SRT file to a free-form translated text while preserving the original timestamps.
 
-Il progetto espone:
+The project provides:
 
-- una libreria locale in [aligner.py](/Users/alessio/aligner/aligner.py) per l'allineamento
-- una API FastAPI in [server.py](/Users/alessio/aligner/server.py) protetta con Bearer token
+- a local alignment library in [aligner.py](/Users/alessio/aligner/aligner.py)
+- a FastAPI API in [server.py](/Users/alessio/aligner/server.py), protected with a Bearer token
 
-## Come funziona
+## How it works
 
-L'algoritmo:
+The algorithm:
 
-- carica il file SRT sorgente
-- segmenta il testo target con euristiche generiche, non dipendenti dalla lingua
-- usa un modello `sentence-transformers` multilingue per confrontare i segmenti
-- esegue un allineamento monotono many-to-many
-- distribuisce il testo target sui cue originali e produce un nuovo SRT
+- loads the source SRT file
+- segments the target text using generic, language-agnostic heuristics
+- uses a multilingual `sentence-transformers` model to compare segments
+- performs monotonic many-to-many alignment
+- distributes the target text across the original cues and produces a new SRT
 
-## Requisiti
+## Requirements
 
-- Python 3.12 consigliato
-- ambiente virtuale attivo oppure uso esplicito di `env/bin/python`
+- Python 3.12 recommended
+- an active virtual environment, or explicit use of `env/bin/python`
 
-## Installazione
+## Installation
 
 ```bash
 python3 -m venv env
 env/bin/pip install -r requirements.txt
 ```
 
-## Configurazione
+## Configuration
 
-Copia `.env.example` in `.env` e imposta i valori:
+Copy `.env.example` to `.env` and set the values:
 
 ```bash
 cp .env.example .env
 ```
 
-Variabili disponibili:
+Available variables:
 
-- `API_BEARER_TOKEN`: token richiesto per autenticarsi verso l'API
-- `MODEL_NAME`: modello `sentence-transformers` da usare per l'allineamento
+- `API_BEARER_TOKEN`: token required to authenticate with the API
+- `MODEL_NAME`: `sentence-transformers` model to use for alignment
 
-Le stesse variabili possono anche essere passate come normali variabili d'ambiente del processo.
+The same variables can also be passed as standard process environment variables.
 
-## Avvio del server
+## Starting the server
 
 ```bash
 env/bin/uvicorn server:app --reload
 ```
 
-All'avvio il servizio stampa il device usato per il modello:
+On startup, the service prints the device used for the model:
 
 ```text
 Model loaded on device: cpu
 ```
 
-La selezione del device avviene in questo ordine:
+The device is selected in this order:
 
-- `mps` se disponibile
-- altrimenti `cuda`
-- altrimenti `cpu`
+- `mps` if available
+- otherwise `cuda`
+- otherwise `cpu`
 
-## Endpoint
+## Endpoints
 
 ### `GET /health`
 
-Richiede header:
+Required header:
 
 ```text
 Authorization: Bearer <token>
 ```
 
-Esempio:
+Example:
 
 ```bash
 curl http://127.0.0.1:8000/health \
-  -H "Authorization: Bearer il-tuo-token"
+  -H "Authorization: Bearer your-token"
 ```
 
 ### `POST /align`
 
-Richiede header:
+Required header:
 
 ```text
 Authorization: Bearer <token>
 ```
 
-Parametri `multipart/form-data`:
+`multipart/form-data` parameters:
 
-- `srt_file`: file `.srt` obbligatorio
-- `translation_text`: testo tradotto in chiaro, opzionale
-- `translation_file`: file di testo UTF-8 con la traduzione, opzionale
+- `srt_file`: required `.srt` file
+- `translation_text`: optional plain translated text
+- `translation_file`: optional UTF-8 text file containing the translation
 
-Devi fornire uno solo tra `translation_text` e `translation_file`.
+You must provide only one of `translation_text` or `translation_file`.
 
-Esempio con file di traduzione:
+Example using a translation file:
 
 ```bash
 curl -X POST http://127.0.0.1:8000/align \
-  -H "Authorization: Bearer il-tuo-token" \
+  -H "Authorization: Bearer your-token" \
   -F "srt_file=@input.srt" \
   -F "translation_file=@translation.txt" \
   -o output.srt
 ```
 
-Esempio con testo inline:
+Example using inline text:
 
 ```bash
 curl -X POST http://127.0.0.1:8000/align \
-  -H "Authorization: Bearer il-tuo-token" \
+  -H "Authorization: Bearer your-token" \
   -F "srt_file=@input.srt" \
   -F "translation_text=$(cat translation.txt)" \
   -o output.srt
 ```
 
-## Uso come libreria
+## Library usage
 
-Puoi usare direttamente la funzione `align_text_to_srt_advanced`:
+You can use the `align_text_to_srt_advanced` function directly:
 
 ```python
 from aligner import align_text_to_srt_advanced
@@ -131,8 +131,8 @@ align_text_to_srt_advanced(
 )
 ```
 
-## Note
+## Notes
 
-- L'API si aspetta file SRT e testo di traduzione in UTF-8
-- Il modello viene caricato all'avvio del server, non a ogni richiesta
-- Se il modello non è disponibile localmente, `sentence-transformers` proverà a scaricarlo
+- The API expects SRT files and translation text encoded in UTF-8
+- The model is loaded at server startup, not on every request
+- If the model is not available locally, `sentence-transformers` will try to download it
