@@ -1,0 +1,7 @@
+pysrt
+sentence-transformers
+numpy
+fastapi
+uvicorn
+python-multipart
+python-dotenv
