@@ -1,6 +1,7 @@
 import re
 import math
 import os
+from difflib import SequenceMatcher
 from pathlib import Path
 import numpy as np
 import pysrt
@@ -201,27 +202,7 @@ def _segment_target_text(text: str) -> List[str]:
             if p:
                 segments.append(p)
 
-    # Merge di segmenti troppo piccoli
-    merged = []
-    buffer = ""
-    for seg in segments:
-        if len(seg.split()) <= 2 and merged:
-            merged[-1] = (merged[-1] + " " + seg).strip()
-        elif len(seg.split()) <= 2:
-            buffer = (buffer + " " + seg).strip()
-        else:
-            if buffer:
-                seg = (buffer + " " + seg).strip()
-                buffer = ""
-            merged.append(seg)
-
-    if buffer:
-        if merged:
-            merged[-1] = (merged[-1] + " " + buffer).strip()
-        else:
-            merged.append(buffer)
-
-    return merged
+    return _merge_fragmentary_segments(segments)
 
 
 def _split_into_sentences(text: str) -> List[str]:
@@ -271,27 +252,7 @@ def _split_long_sentence(sentence: str) -> List[str]:
         else:
             final_parts.append(part)
 
-    # Evita segmenti ridicoli
-    cleaned = []
-    buffer = ""
-    for part in final_parts:
-        if len(part.split()) <= 3 and cleaned:
-            cleaned[-1] = cleaned[-1] + " " + part
-        elif len(part.split()) <= 3:
-            buffer = (buffer + " " + part).strip()
-        else:
-            if buffer:
-                part = (buffer + " " + part).strip()
-                buffer = ""
-            cleaned.append(part)
-
-    if buffer:
-        if cleaned:
-            cleaned[-1] += " " + buffer
-        else:
-            cleaned.append(buffer)
-
-    return cleaned if cleaned else [sentence]
+    return _merge_fragmentary_segments(final_parts) or [sentence]
 
 
 def _l2_normalize(x: np.ndarray) -> np.ndarray:
@@ -317,6 +278,81 @@ def _monotonic_group_alignment(
     n = len(src_cues_norm)
     m = len(tgt_segments)
 
+    anchors = _find_lexical_anchors(src_cues_norm, tgt_segments)
+    if anchors:
+        alignment: List[Tuple[int, int, int, int]] = []
+        prev_i = 0
+        prev_j = 0
+
+        for anchor_i, anchor_j in anchors:
+            if anchor_i > prev_i or anchor_j > prev_j:
+                alignment.extend(
+                    _dp_align_span(
+                        src_cues_norm=src_cues_norm,
+                        tgt_segments=tgt_segments,
+                        get_group_embedding=get_group_embedding,
+                        src_start=prev_i,
+                        src_end=anchor_i,
+                        tgt_start=prev_j,
+                        tgt_end=anchor_j,
+                        max_src_group=max_src_group,
+                        max_tgt_group=max_tgt_group,
+                    )
+                )
+
+            alignment.append((anchor_i, anchor_i + 1, anchor_j, anchor_j + 1))
+            prev_i = anchor_i + 1
+            prev_j = anchor_j + 1
+
+        if prev_i < n or prev_j < m:
+            alignment.extend(
+                _dp_align_span(
+                    src_cues_norm=src_cues_norm,
+                    tgt_segments=tgt_segments,
+                    get_group_embedding=get_group_embedding,
+                    src_start=prev_i,
+                    src_end=n,
+                    tgt_start=prev_j,
+                    tgt_end=m,
+                    max_src_group=max_src_group,
+                    max_tgt_group=max_tgt_group,
+                )
+            )
+
+        return alignment
+
+    return _dp_align_span(
+        src_cues_norm=src_cues_norm,
+        tgt_segments=tgt_segments,
+        get_group_embedding=get_group_embedding,
+        src_start=0,
+        src_end=n,
+        tgt_start=0,
+        tgt_end=m,
+        max_src_group=max_src_group,
+        max_tgt_group=max_tgt_group,
+    )
+
+
+def _dp_align_span(
+    src_cues_norm: List[str],
+    tgt_segments: List[str],
+    get_group_embedding,
+    src_start: int,
+    src_end: int,
+    tgt_start: int,
+    tgt_end: int,
+    max_src_group: int,
+    max_tgt_group: int,
+) -> List[Tuple[int, int, int, int]]:
+    n = src_end - src_start
+    m = tgt_end - tgt_start
+
+    if n == 0 and m == 0:
+        return []
+    if n == 0 or m == 0:
+        return []
+
     NEG_INF = -1e18
     dp = np.full((n + 1, m + 1), NEG_INF, dtype=np.float64)
     back: Dict[Tuple[int, int], Tuple[int, int, int, int]] = {}
@@ -339,10 +375,10 @@ def _monotonic_group_alignment(
                     score = _group_alignment_score(
                         src_cues_norm=src_cues_norm,
                         tgt_segments=tgt_segments,
-                        i0=i,
-                        i1=i + di,
-                        j0=j,
-                        j1=j + dj,
+                        i0=src_start + i,
+                        i1=src_start + i + di,
+                        j0=tgt_start + j,
+                        j1=tgt_start + j + dj,
                         get_group_embedding=get_group_embedding,
                     )
 
@@ -358,11 +394,52 @@ def _monotonic_group_alignment(
     i, j = n, m
     while (i, j) != (0, 0):
         pi, pj, di, dj = back[(i, j)]
-        alignment.append((pi, pi + di, pj, pj + dj))
+        alignment.append(
+            (
+                src_start + pi,
+                src_start + pi + di,
+                tgt_start + pj,
+                tgt_start + pj + dj,
+            )
+        )
         i, j = pi, pj
 
     alignment.reverse()
     return alignment
+
+
+def _find_lexical_anchors(
+    src_cues_norm: List[str],
+    tgt_segments: List[str],
+) -> List[Tuple[int, int]]:
+    n = len(src_cues_norm)
+    m = len(tgt_segments)
+    if n == 0 or m == 0:
+        return []
+
+    window = max(6, abs(n - m) + 3)
+    chosen: List[Tuple[int, int]] = []
+    prev_j = -1
+
+    for i, src_text in enumerate(src_cues_norm):
+        expected_j = round(i * m / max(n, 1))
+        j_lo = max(prev_j + 1, expected_j - window)
+        j_hi = min(m, expected_j + window + 1)
+
+        best_j = None
+        best_score = 0.0
+        for j in range(j_lo, j_hi):
+            tgt_text = tgt_segments[j]
+            score = _lexical_similarity_bonus(src_text, tgt_text) + _anchor_bonus(src_text, tgt_text)
+            if score > best_score:
+                best_score = score
+                best_j = j
+
+        if best_j is not None and best_score >= 0.18:
+            chosen.append((i, best_j))
+            prev_j = best_j
+
+    return chosen
 
 
 def _group_alignment_score(
@@ -399,7 +476,9 @@ def _group_alignment_score(
     # Bonus per numeri/token capitalizzati condivisi come ancore deboli
     anchor_bonus = _anchor_bonus(src_text, tgt_text)
 
-    return sim - len_penalty - size_penalty + punct_bonus + anchor_bonus
+    lexical_bonus = _lexical_similarity_bonus(src_text, tgt_text)
+
+    return sim - len_penalty - size_penalty + punct_bonus + anchor_bonus + lexical_bonus
 
 
 def _anchor_bonus(it_text: str, en_text: str) -> float:
@@ -419,6 +498,47 @@ def _anchor_bonus(it_text: str, en_text: str) -> float:
     return bonus
 
 
+def _comparison_key(text: str) -> str:
+    text = _normalize_subtitle_text(text).casefold()
+    text = re.sub(r"[\"'`“”‘’«»]", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _tokenize_for_match(text: str) -> List[str]:
+    return re.findall(r"\w+", _comparison_key(text), flags=re.UNICODE)
+
+
+def _lexical_similarity_bonus(src_text: str, tgt_text: str) -> float:
+    src_key = _comparison_key(src_text)
+    tgt_key = _comparison_key(tgt_text)
+
+    if not src_key or not tgt_key:
+        return 0.0
+
+    if src_key == tgt_key:
+        return 0.45
+
+    seq_ratio = SequenceMatcher(None, src_key, tgt_key).ratio()
+    src_tokens = set(_tokenize_for_match(src_key))
+    tgt_tokens = set(_tokenize_for_match(tgt_key))
+
+    token_overlap = 0.0
+    if src_tokens and tgt_tokens:
+        token_overlap = len(src_tokens & tgt_tokens) / len(src_tokens | tgt_tokens)
+
+    bonus = 0.0
+    if seq_ratio >= 0.92:
+        bonus += 0.25
+    elif seq_ratio >= 0.82:
+        bonus += 0.15
+    elif seq_ratio >= 0.72:
+        bonus += 0.08
+
+    bonus += token_overlap * 0.12
+    return bonus
+
+
 def _distribute_target_text_over_cues(
     source_texts: List[str],
     target_text: str,
@@ -435,6 +555,11 @@ def _distribute_target_text_over_cues(
         return [target_text.strip()]
 
     units = _split_text_for_distribution(target_text)
+    if len(units) == n:
+        candidate = _assign_units_monotonically(source_texts, units)
+        if candidate:
+            return candidate
+
     if len(units) == 1:
         return _split_text_proportionally(target_text, source_texts)
 
@@ -467,6 +592,24 @@ def _distribute_target_text_over_cues(
     return pieces
 
 
+def _assign_units_monotonically(source_texts: List[str], units: List[str]) -> Optional[List[str]]:
+    if len(source_texts) != len(units):
+        return None
+
+    scores = []
+    for source_text, unit in zip(source_texts, units):
+        score = _lexical_similarity_bonus(source_text, unit)
+        score += _anchor_bonus(source_text, unit)
+        scores.append(score)
+
+    # Richiede almeno un minimo di evidenza lessicale, altrimenti il fallback
+    # proporzionale resta più robusto.
+    if max(scores, default=0.0) < 0.08:
+        return None
+
+    return [unit.strip() for unit in units]
+
+
 def _split_text_for_distribution(text: str) -> List[str]:
     """
     Spezza un gruppo testuale in micro-unità più facili da distribuire sui cue.
@@ -492,15 +635,42 @@ def _split_text_for_distribution(text: str) -> List[str]:
         else:
             refined.append(part)
 
-    # Merge segmenti troppo piccoli
-    merged = []
-    for part in refined:
-        if merged and len(part.split()) <= 2:
-            merged[-1] = merged[-1] + " " + part
-        else:
-            merged.append(part)
+    return _merge_fragmentary_segments(refined) or [text]
 
-    return merged if merged else [text]
+
+def _ends_with_terminal_punctuation(text: str) -> bool:
+    return bool(re.search(r"[.!?…。！？؟۔]+[\"'”’»)]*$", text.strip()))
+
+
+def _merge_fragmentary_segments(parts: List[str]) -> List[str]:
+    merged: List[str] = []
+    buffer = ""
+
+    for raw_part in parts:
+        part = raw_part.strip()
+        if not part:
+            continue
+
+        is_short = len(part.split()) <= 2
+        is_complete = _ends_with_terminal_punctuation(part)
+
+        if is_short and not is_complete:
+            buffer = f"{buffer} {part}".strip()
+            continue
+
+        if buffer:
+            part = f"{buffer} {part}".strip()
+            buffer = ""
+
+        merged.append(part)
+
+    if buffer:
+        if merged and not _ends_with_terminal_punctuation(merged[-1]):
+            merged[-1] = f"{merged[-1]} {buffer}".strip()
+        else:
+            merged.append(buffer)
+
+    return merged
 
 
 def _split_text_proportionally(text: str, source_texts: List[str]) -> List[str]:
@@ -674,14 +844,10 @@ def _fill_empty_slots(texts: List[str]) -> List[str]:
         prev_text = texts[i - 1].strip() if i > 0 else ""
         next_text = texts[i + 1].strip() if i < len(texts) - 1 else ""
 
-        if prev_text and next_text:
-            texts[i] = next_text
-        elif prev_text:
-            texts[i] = prev_text
-        elif next_text:
+        if prev_text and next_text and prev_text == next_text:
             texts[i] = next_text
         else:
-            texts[i] = "..."
+            texts[i] = ""
 
     return texts
 
